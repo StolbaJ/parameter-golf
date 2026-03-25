@@ -915,8 +915,16 @@ def eval_val_sliding_ttt(
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
     stride: int, batch_seqs: int = 32, log0=print,
 ) -> tuple[float, float]:
-    """Legal score-first TTT (PR #461 recipe): score each chunk BEFORE training on it.
-    Every token is scored only by a model that has never trained on it."""
+    """Legal score-first TTT with early stopping + checkpoint restore.
+
+    Each chunk is scored BEFORE the model trains on it. Every 50 chunks the
+    running BPB is checked; if it has not improved for 3 consecutive checks
+    the best-so-far model state is restored and training stops.  Scoring
+    continues for all remaining chunks so the final BPB covers the full val set.
+    """
+    _CKPT_INTERVAL = 50   # check every N chunks
+    _PATIENCE = 3         # stop after this many non-improving checks
+
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     ttt_chunk = args.ttt_chunk_tokens
@@ -934,7 +942,8 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
          f"total_windows={len(window_starts)} stride={stride} "
          f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
-         f"freeze_blocks={args.ttt_freeze_blocks}")
+         f"freeze_blocks={args.ttt_freeze_blocks} "
+         f"early_stop=every{_CKPT_INTERVAL}chunks_patience{_PATIENCE}")
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -948,6 +957,15 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+
+    # Early-stopping state
+    best_bpb = float("inf")
+    best_ckpt: dict[str, Tensor] = {
+        n: p.detach().cpu().clone() for n, p in base_model.named_parameters()
+    }
+    no_improve_checks = 0
+    training_stopped = False
+
     t0 = time.perf_counter()
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
@@ -958,6 +976,8 @@ def eval_val_sliding_ttt(
         my_s = (len(windows) * rank) // world_size
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
+
+        # --- Phase 1: SCORE (always, regardless of training_stopped) ---
         base_model.eval()
         with torch.inference_mode():
             for bi in range(0, len(my_windows), batch_seqs):
@@ -989,11 +1009,39 @@ def eval_val_sliding_ttt(
                     tb = base_bytes_lut[tgt].to(torch.float64)
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
+
+        # --- Early-stopping check every _CKPT_INTERVAL chunks ---
+        if (ci + 1) % _CKPT_INTERVAL == 0 and not training_stopped:
+            # Sync running BPB across ranks
+            _ls = loss_sum.clone()
+            _tc = token_count.clone()
+            _bc = byte_count.clone()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(_ls, op=dist.ReduceOp.SUM)
+                dist.all_reduce(_tc, op=dist.ReduceOp.SUM)
+                dist.all_reduce(_bc, op=dist.ReduceOp.SUM)
+            cur_bpb = (_ls / _tc).item() / math.log(2.0) * (_tc / _bc).item() if _tc.item() > 0 else float("inf")
+            if cur_bpb < best_bpb:
+                best_bpb = cur_bpb
+                best_ckpt = {n: p.detach().cpu().clone() for n, p in base_model.named_parameters()}
+                no_improve_checks = 0
+                log0(f"  ttt_ckpt [ci={ci+1}] new_best bpb={best_bpb:.6f}")
+            else:
+                no_improve_checks += 1
+                log0(f"  ttt_ckpt [ci={ci+1}] no_improve #{no_improve_checks} cur={cur_bpb:.6f} best={best_bpb:.6f}")
+                if no_improve_checks >= _PATIENCE:
+                    log0(f"  ttt_early_stop at chunk {ci+1}: restoring best state (bpb={best_bpb:.6f}), scoring only from here")
+                    with torch.no_grad():
+                        for n, p in base_model.named_parameters():
+                            if n in best_ckpt:
+                                p.data.copy_(best_ckpt[n].to(device=p.device, dtype=p.dtype))
+                    training_stopped = True
+
+        # --- Phase 2: TRAIN (only if not stopped) ---
         is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and args.ttt_epochs > 0:
+        if not is_last_chunk and args.ttt_epochs > 0 and not training_stopped:
             base_model.train()
-            # Rotary caches were created under inference_mode; clear them so they
-            # are recomputed outside inference_mode and can be used in autograd.
+            # Rotary caches created under inference_mode can't be used in autograd
             for m in base_model.modules():
                 if hasattr(m, '_seq_len_cached'):
                     m._seq_len_cached = 0
@@ -1025,11 +1073,14 @@ def eval_val_sliding_ttt(
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                         torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
                         optimizer.step()
+
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
             rl = loss_sum.item() / max(token_count.item(), 1)
             rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            status = "(score-only)" if training_stopped else ""
+            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s {status}")
+
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1039,6 +1090,7 @@ def eval_val_sliding_ttt(
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
+    log0(f"ttt_sliding:done training_stopped={training_stopped} best_ckpt_bpb={best_bpb:.6f}")
     log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
 def _classify_param(name: str) -> str:
