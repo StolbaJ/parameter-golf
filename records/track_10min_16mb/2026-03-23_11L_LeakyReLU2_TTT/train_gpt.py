@@ -1,14 +1,4 @@
-"""
-Submission: 11-layer + LeakyReLU(0.5)² + Legal TTT (score-first).
-Architecture base: PR #414 stack — 11L, XSA last-4, partial RoPE (16 dims), LN-scale,
-  Value Embedding (layers 9-10, dim 128), BigramHash (2048, dim 128), GQA (8H/2KV).
-Key improvements over #2 entry (1.1233 bpb):
-  - LeakyReLU(0.5)²: F.leaky_relu(x, 0.5).square() in MLP (-0.003 bpb pre-TTT)
-  - Legal score-first TTT: score each validation chunk BEFORE adapting on it
-      ttt_lr=0.002, ttt_epochs=3, ttt_chunk_tokens=32768, ttt_freeze_blocks=0 (-0.002 bpb)
-  - FA3 (FlashAttention 3) optional — falls back to SDPA on older hardware
-Expected: ~1.119-1.121 bpb (competitive with SOTA 1.1194).
-"""
+"""11L + LeakyReLU(0.5)² + continuous legal TTT + LZMA compression."""
 from __future__ import annotations
 import copy
 import glob
@@ -20,13 +10,8 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
+import lzma
 from pathlib import Path
-try:
-    import zstandard
-    _COMPRESSOR = "zstd"
-except ImportError:
-    _COMPRESSOR = "zlib"
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -101,10 +86,10 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     # Legal score-first TTT (post-training test-time adaptation on val chunks)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.001))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 4))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
@@ -915,15 +900,9 @@ def eval_val_sliding_ttt(
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
     stride: int, batch_seqs: int = 32, log0=print,
 ) -> tuple[float, float]:
-    """Legal score-first TTT with early stopping + checkpoint restore.
-
-    Each chunk is scored BEFORE the model trains on it. Every 50 chunks the
-    running BPB is checked; if it has not improved for 3 consecutive checks
-    the best-so-far model state is restored and training stops.  Scoring
-    continues for all remaining chunks so the final BPB covers the full val set.
+    """Continuous legal score-first TTT with cosine LR decay.
+    Each chunk is scored BEFORE the model trains on it.
     """
-    _CKPT_INTERVAL = 10   # check every N chunks
-    _PATIENCE = 3         # stop after this many non-improving checks
 
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
@@ -942,8 +921,7 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
          f"total_windows={len(window_starts)} stride={stride} "
          f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
-         f"freeze_blocks={args.ttt_freeze_blocks} "
-         f"early_stop=every{_CKPT_INTERVAL}chunks_patience{_PATIENCE}")
+         f"freeze_blocks={args.ttt_freeze_blocks}")
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -957,15 +935,6 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
-
-    # Early-stopping state
-    best_bpb = float("inf")
-    best_ckpt: dict[str, Tensor] = {
-        n: p.detach().cpu().clone() for n, p in base_model.named_parameters()
-    }
-    no_improve_checks = 0
-    training_stopped = False
-
     t0 = time.perf_counter()
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
@@ -977,7 +946,7 @@ def eval_val_sliding_ttt(
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
 
-        # --- Phase 1: SCORE (always, regardless of training_stopped) ---
+        # --- Phase 1: SCORE this chunk ---
         base_model.eval()
         with torch.inference_mode():
             for bi in range(0, len(my_windows), batch_seqs):
@@ -1010,36 +979,9 @@ def eval_val_sliding_ttt(
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
 
-        # --- Early-stopping check every _CKPT_INTERVAL chunks ---
-        if (ci + 1) % _CKPT_INTERVAL == 0 and not training_stopped:
-            # Sync running BPB across ranks
-            _ls = loss_sum.clone()
-            _tc = token_count.clone()
-            _bc = byte_count.clone()
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(_ls, op=dist.ReduceOp.SUM)
-                dist.all_reduce(_tc, op=dist.ReduceOp.SUM)
-                dist.all_reduce(_bc, op=dist.ReduceOp.SUM)
-            cur_bpb = (_ls / _tc).item() / math.log(2.0) * (_tc / _bc).item() if _tc.item() > 0 else float("inf")
-            if cur_bpb < best_bpb:
-                best_bpb = cur_bpb
-                best_ckpt = {n: p.detach().cpu().clone() for n, p in base_model.named_parameters()}
-                no_improve_checks = 0
-                log0(f"  ttt_ckpt [ci={ci+1}] new_best bpb={best_bpb:.6f}")
-            else:
-                no_improve_checks += 1
-                log0(f"  ttt_ckpt [ci={ci+1}] no_improve #{no_improve_checks} cur={cur_bpb:.6f} best={best_bpb:.6f}")
-                if no_improve_checks >= _PATIENCE:
-                    log0(f"  ttt_early_stop at chunk {ci+1}: restoring best state (bpb={best_bpb:.6f}), scoring only from here")
-                    with torch.no_grad():
-                        for n, p in base_model.named_parameters():
-                            if n in best_ckpt:
-                                p.data.copy_(best_ckpt[n].to(device=p.device, dtype=p.dtype))
-                    training_stopped = True
-
-        # --- Phase 2: TRAIN (only if not stopped) ---
+        # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and args.ttt_epochs > 0 and not training_stopped:
+        if not is_last_chunk and args.ttt_epochs > 0:
             base_model.train()
             # Rotary caches created under inference_mode can't be used in autograd
             for m in base_model.modules():
@@ -1078,8 +1020,7 @@ def eval_val_sliding_ttt(
             elapsed = time.perf_counter() - t0
             rl = loss_sum.item() / max(token_count.item(), 1)
             rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            status = "(score-only)" if training_stopped else ""
-            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s {status}")
+            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1090,7 +1031,6 @@ def eval_val_sliding_ttt(
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
-    log0(f"ttt_sliding:done training_stopped={training_stopped} best_ckpt_bpb={best_bpb:.6f}")
     log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
 def _classify_param(name: str) -> str:
@@ -1101,33 +1041,6 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
-def _pack6(arr: np.ndarray) -> np.ndarray:
-    """Pack int8 values in [-31,31] into 6-bit packed uint8 (4 values per 3 bytes)."""
-    flat = arr.reshape(-1)
-    u = (flat.astype(np.int16) + 31).astype(np.uint8)  # shift to [0,62]
-    pad = (-len(u)) % 4
-    if pad:
-        u = np.concatenate([u, np.zeros(pad, dtype=np.uint8)])
-    g = u.reshape(-1, 4).astype(np.uint32)
-    p = (g[:, 0] << 18) | (g[:, 1] << 12) | (g[:, 2] << 6) | g[:, 3]
-    out = np.zeros(len(p) * 3, dtype=np.uint8)
-    out[0::3] = (p >> 16) & 0xFF
-    out[1::3] = (p >> 8) & 0xFF
-    out[2::3] = p & 0xFF
-    return out
-
-def _unpack6(packed: np.ndarray, n: int, shape: tuple) -> np.ndarray:
-    """Unpack 6-bit packed uint8 back to int8 values in [-31,31]."""
-    b = packed.astype(np.uint32)
-    p = (b[0::3] << 16) | (b[1::3] << 8) | b[2::3]
-    n_groups = (n + 3) // 4
-    u = np.zeros(n_groups * 4, dtype=np.uint8)
-    u[0::4] = (p >> 18) & 0x3F
-    u[1::4] = (p >> 12) & 0x3F
-    u[2::4] = (p >> 6) & 0x3F
-    u[3::4] = p & 0x3F
-    return (u[:n].astype(np.int16) - 31).astype(np.int8).reshape(shape)
-
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -1169,12 +1082,9 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
-            q_np = q.cpu().numpy()
-            packed = _pack6(q_np)
-            result[name + ".q"] = torch.from_numpy(packed)
-            result[name + ".qn"] = torch.tensor(q_np.size, dtype=torch.int64)
+            result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6packed", "shape": list(q.shape)}
+            meta[name] = {"type": "int6"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1195,13 +1105,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                 t = t.to(orig_dtype)
             out[name] = t
             continue
-        s = result[name + ".scale"]
-        if isinstance(info, dict) and info.get("type") == "int6packed":
-            n = int(result[name + ".qn"].item())
-            shape = tuple(info["shape"])
-            q = torch.from_numpy(_unpack6(result[name + ".q"].numpy(), n, shape))
-        else:
-            q = result[name + ".q"]
+        q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
@@ -1570,21 +1474,20 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
+    quant_blob = lzma.compress(quant_raw, preset=6)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
+        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
-        io.BytesIO(zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _COMPRESSOR == "zstd" else zlib.decompress(quant_blob_disk)),
+        io.BytesIO(lzma.decompress(quant_blob_disk)),
         map_location="cpu",
     )
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
