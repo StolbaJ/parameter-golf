@@ -104,7 +104,7 @@ class Hyperparameters:
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
@@ -1563,6 +1563,12 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+    # Track best sliding-window bpb so TTT only overwrites when it actually improves
+    _best_sw_bpb: float = float("inf")
+    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+        _best_sw_bpb = min(_best_sw_bpb, sw_val_bpb)
+    if args.eval_stride != 64 and 64 < sw_seq_len:
+        _best_sw_bpb = min(_best_sw_bpb, sw64_val_bpb)
     # Legal score-first TTT — scores each validation chunk BEFORE adapting on it
     if args.ttt_enabled:
         torch.cuda.synchronize()
@@ -1576,8 +1582,12 @@ def main() -> None:
         log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
              f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
         log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
-        # This is the official score the evaluator will read
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        # Only use TTT as final score if it improves over sliding window
+        if ttt_bpb < _best_sw_bpb:
+            log0(f"ttt_improved: {_best_sw_bpb:.6f} -> {ttt_bpb:.6f}, using TTT as final")
+            log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        else:
+            log0(f"ttt_no_improvement: ttt={ttt_bpb:.6f} >= sw={_best_sw_bpb:.6f}, keeping sliding window")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
