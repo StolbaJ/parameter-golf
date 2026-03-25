@@ -1,6 +1,6 @@
 # Mixed-Precision QAT: Int5 MLP + Int6 Attention + Full SOTA Stack
 
-**Expected val_bpb: ~1.135–1.138** (projection pending actual run; beat SOTA target is < 1.138)
+**val_bpb: 1.14777536** (seed=42, 1 run; SOTA baseline = 1.1428)
 
 Built on PR #162 by @unnir and the `2026-03-20_10L_Int5MLP_MuonWD04_SWA50` SOTA.
 
@@ -89,8 +89,24 @@ torchrun --standalone --nproc_per_node=8 \
 
 Same architecture as SOTA; artifact size should be ~15.8–15.9 MB (well within 16 MB).
 
+## Results
+
+| Metric | Value |
+|--------|-------|
+| val_bpb (final, sliding window) | **1.14777536** |
+| val_loss | 1.93796548 |
+| Steps completed | 6137 / 20000 (wallclock cap hit) |
+| Model size (int6+zstd) | 15,901,560 bytes |
+| Code size | 55,721 bytes |
+| Total submission size | 15,957,281 bytes |
+| Peak GPU memory | 23,856 MiB |
+| SWA checkpoints averaged | 24 |
+
+Run stopped at ~600 s wallclock, completing 6137 steps at ~97.77 ms/step on 8×H100.
+
 ## Files
 
 - `train_gpt.py` — training script with mixed QAT
 - `README.md` — this file
-- `submission.json` — metadata (to be updated with actual val_bpb after runs)
+- `submission.json` — run metadata
+- `train_seed42.log` — full training log (seed=42)
