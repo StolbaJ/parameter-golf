@@ -1136,12 +1136,17 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
-    # EMA shadow lives on GPU alongside the training model (≈100MB overhead, negligible on H100)
+    # EMA shadow lives on GPU alongside the training model (≈100MB overhead, negligible on H100).
+    # Use _foreach_* ops to batch all parameter updates into 2 CUDA kernels instead of 400+.
     ema_params: dict[str, Tensor] | None = None
+    ema_vals: list[Tensor] | None = None   # ordered list for foreach ops
+    ema_keys: list[str] | None = None
     if args.ema_enabled:
         with torch.no_grad():
             ema_params = {n: p.data.detach().clone() for n, p in base_model.named_parameters()}
-        log0(f"ema:enabled decay={args.ema_decay} params={len(ema_params)}")
+        ema_keys = list(ema_params.keys())
+        ema_vals = [ema_params[k] for k in ema_keys]
+        log0(f"ema:enabled decay={args.ema_decay} params={len(ema_params)} (foreach-optimized)")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1201,12 +1206,11 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # EMA update — ~50µs per step on H100, negligible training overhead
-        if ema_params is not None:
-            ema_d = args.ema_decay
-            with torch.no_grad():
-                for n, p in base_model.named_parameters():
-                    ema_params[n].mul_(ema_d).add_(p.data, alpha=1.0 - ema_d)
+        # EMA update — 2 batched CUDA kernels instead of ~400 separate launches
+        if ema_vals is not None:
+            live_vals = [p.data for n, p in base_model.named_parameters() if n in ema_params]
+            torch._foreach_mul_(ema_vals, args.ema_decay)
+            torch._foreach_add_(ema_vals, live_vals, alpha=1.0 - args.ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
