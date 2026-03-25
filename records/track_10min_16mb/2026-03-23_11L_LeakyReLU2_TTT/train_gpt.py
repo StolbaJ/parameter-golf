@@ -992,6 +992,11 @@ def eval_val_sliding_ttt(
         is_last_chunk = (ci == num_chunks - 1)
         if not is_last_chunk and args.ttt_epochs > 0:
             base_model.train()
+            # Rotary caches were created under inference_mode; clear them so they
+            # are recomputed outside inference_mode and can be used in autograd.
+            for m in base_model.modules():
+                if hasattr(m, '_seq_len_cached'):
+                    m._seq_len_cached = 0
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
                 cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
